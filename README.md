@@ -1,100 +1,172 @@
-# CampusCraves
+# CampusCraves 🍽️
 
-CampusCraves is a platform designed to facilitate food sharing within a campus community. Users can post, reserve, and complete transactions for food items, promoting sustainability and reducing food waste.
+A campus food-sharing platform that reduces food waste by letting students post surplus food, reserve items, and complete hand-offs — built as a full-stack software engineering class project by a team of four at NYU Abu Dhabi.
 
-## Features
+**Stack:** React Native (Expo) · FastAPI · MongoDB · deployed on Render
 
-- **Post Food**: Users can create posts for food items, including details like name, quantity, category, dietary info, pickup location, and time.
-- **Reserve Food**: Users can reserve available food items.
-- **Complete Transactions**: Reserved food items can be marked as completed once the transaction is done.
-- **Image Upload**: Users can upload images of food items.
-- **Expiration Tracking**: Posts include expiration times to ensure food safety.
+> This fork adds architecture documentation and repo hygiene on top of the original team repo ([bipana06/campusCraves](https://github.com/bipana06/campusCraves)).
 
-## Technologies Used
+## Why it's interesting
 
-### Frontend
-- **React Native**: For building the mobile application.
-- **Expo**: For development and testing.
-- **React Native Image Picker**: For image selection.
+- **A concurrency-safe reservation protocol.** Food items move through a traffic-light lifecycle (`green` available → `yellow` reserved → `red` completed). State transitions use MongoDB *compare-and-set* updates — the update filter includes the expected current status — so two users racing to reserve the same item can't both win.
+- **Authorization at the transition level.** Only the user who reserved an item may complete the transaction; the check happens server-side in the update filter, not just in the UI.
+- **A moderation subsystem.** Users can report bad actors per post (with server-side "can this user report this post?" checks to prevent duplicates), and admins review reports through a pending → reviewed workflow.
+- **Three auth paths** (email/password signup, Google sign-in, NYU NetID registration) converging on one user model.
 
-### Backend
-- **FastAPI**: For building the RESTful API.
-- **MongoDB**: For storing food posts and user data.
-- **Pydantic**: For data validation.
+## System architecture
 
-## Installation
+```mermaid
+flowchart LR
+    subgraph Client["📱 React Native app (Expo)"]
+        UI["Screens<br/>Marketplace · FoodPost · Report<br/>NetID · Notifications"]
+        API["apiService.js<br/>(central API client)"]
+        UI --> API
+    end
 
-### Prerequisites
-- Node.js and npm
-- Python 3.12 or higher
-- MongoDB
-- Expo CLI
+    subgraph Server["⚙️ FastAPI (Render)"]
+        FR["food router<br/>/api/food"]
+        UR["users router<br/>/api/users"]
+        RR["reports router<br/>/api/report"]
+    end
 
-### Frontend Setup
-1. Navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Start the development server:
-   ```bash
-   npx expo start
-   ```
+    subgraph DB["🗄️ MongoDB"]
+        FC[("food")]
+        UC[("users")]
+        RC[("reports")]
+    end
 
-### Backend Setup [Not necessary if you do not want to run it locally, we have our backend deployed on Render] To run the backend locally;
-1. Navigate to the backend directory:
-   ```bash
-   cd CC-backend
-   ```
-2. Create a virtual environment:
-   ```bash
-   python -m venv campusenv
-   source campusenv/bin/activate  # On Windows: campusenv\Scripts\activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Start the FastAPI server:
-   ```bash
-   uvicorn main:app --reload
-   ```
+    API -->|REST / JSON| FR & UR & RR
+    FR --> FC
+    UR --> UC
+    RR --> RC
+    RR -.->|"validates postId"| FC
+```
 
-## API Endpoints
+## Domain model
 
-### Food Posts
-- **POST** `/api/food`: Create a new food post.
-- **GET** `/api/food`: Retrieve all food posts.
-- **POST** `/api/food/reserve`: Reserve a food item.
-- **POST** `/api/food/complete`: Mark a food transaction as complete.
-  
+```mermaid
+erDiagram
+    USER ||--o{ FOODPOST : "posts"
+    USER ||--o{ FOODPOST : "reserves"
+    USER ||--o{ REPORT : "files"
+    FOODPOST ||--o{ REPORT : "is subject of"
+
+    USER {
+        string netId
+        string email
+        string googleId "optional"
+        string role "user | admin"
+        int postCount
+        int reservationCount
+    }
+    FOODPOST {
+        string foodName
+        string category
+        string dietaryInfo
+        string pickupLocation
+        datetime expirationTime
+        string status "green | yellow | red"
+        string reservedBy
+        string photo
+    }
+    REPORT {
+        string postId
+        string user1ID "reporter"
+        string user2ID "reported"
+        string message
+        string reviewStatus "pending | reviewed"
+        string reviewedBy
+    }
+```
+
+## Reservation lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> green : POST /api/food
+    green --> yellow : POST /api/food/reserve<br/>(atomic CAS on status green)
+    yellow --> red : POST /api/food/complete<br/>(atomic CAS, reserver only)
+    red --> [*]
+
+    note right of yellow
+        Update filter matches
+        {_id, status "green"} — a lost
+        race returns 400, never a
+        double reservation
+    end note
+```
+
+## Reserve flow, end to end
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant App as RN App
+    participant F as FastAPI /api/food
+    participant M as MongoDB
+
+    U->>App: Tap "Reserve"
+    App->>F: POST /reserve {food_id, user}
+    F->>M: find_one({_id})
+    M-->>F: item (status green)
+    F->>M: update_one({_id, status green},<br/>{$set: {status yellow, reservedBy: user}})
+    alt update matched
+        M-->>F: modified 1
+        F-->>App: 200 reserved
+        App-->>U: Confirmation
+    else raced by another user
+        M-->>F: modified 0
+        F->>M: find_one({_id}) — re-check
+        F-->>App: 400 already reserved
+        App-->>U: "No longer available"
+    end
+```
+
+## API surface
+
+| Area | Endpoint | Purpose |
+|---|---|---|
+| Food | `POST /api/food` | Create a post (multipart, photo upload) |
+| | `GET /api/food` | List marketplace posts |
+| | `GET /api/food/search` | Filtered search |
+| | `POST /api/food/reserve` | Reserve (green → yellow, atomic) |
+| | `POST /api/food/complete` | Complete hand-off (yellow → red, reserver only) |
+| | `GET /api/food/poster-netid/{id}` | Look up poster's NetID |
+| Users | `POST /api/users/signup` · `/email-login` · `/auth-check` | Email auth |
+| | `POST /api/users/register` | Google / NetID registration |
+| | `GET /api/users/profile/{net_id}` | Profile with post & pickup history |
+| Reports | `POST /api/report` | File a report |
+| | `GET /api/report/can-report/{post}/{user}` | Duplicate-report guard |
+| | `PUT /api/report/{id}` | Admin review (pending → reviewed) |
+| | `GET /api/reports` | Admin list |
+
 ## Testing
-To run our unit test suite, first install all the requirements from tests/requirements.txt, and then follow following commands:
+
+The backend ships with a pytest suite (`CC-backend/tests/`) covering the food, user, and report routers plus database and utility layers, with fixtures in `conftest.py`.
+
+```bash
+cd CC-backend && pip install -r requirements.txt && pytest
 ```
-pytest --cov=main --cov=models --cov=database --cov=utils --cov=routers --cov-report=html
-coverage report
+
+## Running locally
+
+**Frontend** (Expo):
+
+```bash
+cd frontend && npm install && npx expo start
 ```
-## Contributing
 
-Contributors:
-- Aabaran Paudel
-- Bipana Bastola
-- Komal Neupane
-- Manoj Dhakal
+**Backend** (FastAPI + MongoDB):
 
-### Guidelines
-1. Create a new branch for your feature or bug fix.
-2. Use `pip freeze > requirements.txt` before pushing if you install new Python packages.
-3. Submit a pull request for review.
+```bash
+cd CC-backend
+python -m venv campusenv && source campusenv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload
+```
 
-## License
+Set the MongoDB connection string in `CC-backend/.env` (see `database.py`).
 
-This project is licensed under the MIT License.
+## Team
 
-## Acknowledgments
-
-Special thanks to the contributors and the campus community for their support in making this project a reality.
-
+Built by **Manoj Dhakal**, **Komal Neupane**, **Bipana Bastola**, and **Aabaran Paudel** for a Software Engineering course at NYU Abu Dhabi.
